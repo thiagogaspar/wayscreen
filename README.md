@@ -26,6 +26,20 @@ Designed as a Waybar click-to-open menu.
 ./wayscreen
 ```
 
+### Persistência (autostart)
+
+Para restaurar a última config na inicialização sem abrir a UI:
+
+```bash
+/path/to/wayscreen --apply
+```
+
+Adicione ao `exec-once` do Hyprland.
+
+### Profiles
+
+Perfis nomeados podem ser salvos/carregados pelo dropdown na UI.
+
 ### Waybar integration
 
 Add to your `~/.config/waybar/config.jsonc`:
@@ -37,3 +51,8 @@ Add to your `~/.config/waybar/config.jsonc`:
     "tooltip": false
 }
 ```
+
+## Data locations
+
+- Config: `~/.config/wayscreen/config.json`
+- Profiles: `~/.config/wayscreen/profiles/<name>.json`

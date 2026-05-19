@@ -1,11 +1,22 @@
 #!/usr/bin/env python3
 import gi
 gi.require_version('Gtk', '3.0')
-from gi.repository import Gtk, Gdk
+from gi.repository import Gtk, Gdk, GLib
 import subprocess
+import json
+import os
+import sys
+import threading
 
 BUS = ["busctl", "--user", "set-property", "rs.wl-gammarelay", "/", "rs.wl.gammarelay"]
 BUS_GET = ["busctl", "--user", "get-property", "rs.wl-gammarelay", "/", "rs.wl.gammarelay"]
+
+CONFIG_DIR = os.path.expanduser("~/.config/wayscreen")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+PROFILES_DIR = os.path.join(CONFIG_DIR, "profiles")
+
+DEFAULTS = {"Brightness": 1.0, "Temperature": 6500, "Gamma": 1.0}
+
 
 def get_val(prop):
     r = subprocess.run([*BUS_GET, prop], capture_output=True, text=True)
@@ -13,8 +24,146 @@ def get_val(prop):
     parts = r.stdout.strip().split()
     return parts[1] if len(parts) > 1 else None
 
+
 def set_val(prop, typ, val):
     subprocess.run([*BUS, prop, typ, str(val)], capture_output=True)
+
+
+def read_current():
+    vals = {}
+    b = get_val("Brightness")
+    vals["Brightness"] = float(b) if b else DEFAULTS["Brightness"]
+    t = get_val("Temperature")
+    vals["Temperature"] = int(t) if t else DEFAULTS["Temperature"]
+    g = get_val("Gamma")
+    vals["Gamma"] = float(g) if g else DEFAULTS["Gamma"]
+    return vals
+
+
+def apply_values(vals):
+    if "Brightness" in vals:
+        set_val("Brightness", "d", vals["Brightness"])
+    if "Temperature" in vals:
+        set_val("Temperature", "q", int(vals["Temperature"]))
+    if "Gamma" in vals:
+        set_val("Gamma", "d", vals["Gamma"])
+
+
+def load_config():
+    if not os.path.exists(CONFIG_FILE):
+        return {}
+    try:
+        with open(CONFIG_FILE) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_config(vals):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    try:
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(vals, f, indent=2)
+    except OSError:
+        pass
+
+
+def list_profiles():
+    if not os.path.isdir(PROFILES_DIR):
+        return []
+    names = []
+    for fn in sorted(os.listdir(PROFILES_DIR)):
+        if fn.endswith(".json"):
+            names.append(fn[:-5])
+    return names
+
+
+def save_profile(name, vals):
+    os.makedirs(PROFILES_DIR, exist_ok=True)
+    path = os.path.join(PROFILES_DIR, f"{name}.json")
+    try:
+        with open(path, "w") as f:
+            json.dump(vals, f, indent=2)
+    except OSError:
+        pass
+
+
+def load_profile(name):
+    path = os.path.join(PROFILES_DIR, f"{name}.json")
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def delete_profile(name):
+    path = os.path.join(PROFILES_DIR, f"{name}.json")
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _temp_weights(k):
+    k = max(1000.0, min(40000.0, k))
+    if k <= 6500.0:
+        r = 1.0
+        g = 1.0 - 0.15 * (6500.0 - k) / 5500.0
+        b = 0.4 + 0.6 * (k - 1000.0) / 5500.0
+    else:
+        r = 1.0 - 0.3 * (k - 6500.0) / 33500.0
+        g = 1.0 - 0.05 * (k - 6500.0) / 33500.0
+        b = 1.0
+    return max(0.0, r), max(0.0, g), max(0.0, b)
+
+
+def _estimate_temp(avg_r, avg_g, avg_b):
+    best_t = 6500
+    best_var = float("inf")
+    for t in range(1000, 10001, 50):
+        wr, wg, wb = _temp_weights(t)
+        r = avg_r / wr if wr > 0 else 0
+        g = avg_g / wg if wg > 0 else 0
+        b = avg_b / wb if wb > 0 else 0
+        mean = (r + g + b) / 3
+        var = ((r - mean) ** 2 + (g - mean) ** 2 + (b - mean) ** 2) / 3
+        if var < best_var:
+            best_var = var
+            best_t = t
+    return best_t
+
+
+def _capture_avg_rgb():
+    r = subprocess.run(
+        ["ffmpeg", "-f", "v4l2", "-video_size", "320x240",
+         "-i", "/dev/video0", "-vframes", "1",
+         "-vf", "split=3[t][l][r];"
+               "[t]crop=iw:ih/4:0:0,scale=1:1[t];"
+               "[l]crop=iw/5:ih*2/3:0:ih/6,scale=1:1[l];"
+               "[r]crop=iw/5:ih*2/3:iw-iw/5:ih/6,scale=1:1[r];"
+               "[t][l][r]hstack=3",
+         "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+        capture_output=True, timeout=10
+    )
+    if r.returncode != 0 or len(r.stdout) < 9:
+        r2 = subprocess.run(
+            ["ffmpeg", "-f", "v4l2", "-video_size", "320x240",
+             "-i", "/dev/video0", "-vframes", "1",
+             "-vf", "crop=iw:ih/3:0:0,scale=1:1",
+             "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+            capture_output=True, timeout=10
+        )
+        if r2.returncode != 0 or len(r2.stdout) < 3:
+            return None
+        return (r2.stdout[0] / 255.0, r2.stdout[1] / 255.0, r2.stdout[2] / 255.0)
+    tr, tg, tb = r.stdout[0] / 255.0, r.stdout[1] / 255.0, r.stdout[2] / 255.0
+    lr, lg, lb = r.stdout[3] / 255.0, r.stdout[4] / 255.0, r.stdout[5] / 255.0
+    rr, rg, rb = r.stdout[6] / 255.0, r.stdout[7] / 255.0, r.stdout[8] / 255.0
+    return ((tr + lr + rr) / 3, (tg + lg + rg) / 3, (tb + lb + rb) / 3)
+
 
 class CalibArea(Gtk.DrawingArea):
     def __init__(self, w=100, h=150):
@@ -40,16 +189,13 @@ class CalibArea(Gtk.DrawingArea):
         cr.rectangle(0, ramp_h, w, gray_h)
         cr.fill()
 
-        cr.set_source_rgb(0.7, 0.7, 0.7)
-        cr.rectangle(0, ramp_h, 1, gray_h)
-        cr.fill()
-
         colors = [(1,0,0), (0,1,0), (0,0,1), (1,1,0), (0,1,1), (1,0,1), (0.5,0.5,0.5)]
         bar_w = w / len(colors)
         for i, (r, g, b) in enumerate(colors):
             cr.set_source_rgb(r, g, b)
             cr.rectangle(i * bar_w, bar_top, bar_w + 1, bar_h)
             cr.fill()
+
 
 class DisplaySliders(Gtk.Window):
     def __init__(self):
@@ -60,19 +206,24 @@ class DisplaySliders(Gtk.Window):
         self.set_position(Gtk.WindowPosition.CENTER)
         self.set_resizable(False)
         self.set_accept_focus(True)
-        self.set_default_size(530, -1)
+        self.set_default_size(560, -1)
 
         css = b"""
 window { background-color: #2e3440; border: 1px solid #4c566a; border-radius: 8px; }
 label { color: #d8dee9; font-family: 'JetBrainsMono Nerd Font'; font-size: 12px; }
 .val-label { font-size: 11px; color: #88c0d0; }
+.section-label { font-size: 10px; color: #81a1c1; font-weight: bold; margin-top: 4px; }
 button { background: none; border: none; color: #bf616a; font-size: 16px;
     padding: 0 6px; min-width: 0; }
 button:hover { color: #d08770; }
-scale { min-height: 22px; }
+button.profile-btn { font-size: 11px; color: #a3be8c; padding: 2px 8px; }
+button.profile-btn:hover { color: #d08770; }
+button.auto-btn { font-size: 10px; color: #a3be8c; padding: 0 6px; min-width: 0; }
+button.auto-btn:hover { color: #d08770; }
+scale { min-height: 20px; }
 scale trough { min-height: 4px; background-color: #4c566a; border-radius: 2px; }
 scale highlight { background-color: #88c0d0; border-radius: 2px; }
-scale slider { min-width: 14px; min-height: 14px; border-radius: 7px;
+scale slider { min-width: 12px; min-height: 12px; border-radius: 6px;
     background-color: #eceff4; border: none; }
 """
         screen = Gdk.Screen.get_default()
@@ -81,9 +232,14 @@ scale slider { min-width: 14px; min-height: 14px; border-radius: 7px;
         Gtk.StyleContext.add_provider_for_screen(screen, provider,
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
-        b = get_val("Brightness"); b = float(b) if b else 1.0
-        t = get_val("Temperature"); t = int(t) if t else 6500
-        g = get_val("Gamma"); g = float(g) if g else 1.0
+        # Apply saved config on startup
+        saved = load_config()
+        if saved:
+            apply_values(saved)
+
+        b = float(get_val("Brightness") or DEFAULTS["Brightness"])
+        t = int(float(get_val("Temperature") or DEFAULTS["Temperature"]))
+        g = float(get_val("Gamma") or DEFAULTS["Gamma"])
 
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         vbox.set_margin_top(6)
@@ -93,6 +249,10 @@ scale slider { min-width: 14px; min-height: 14px; border-radius: 7px;
         self.add(vbox)
 
         top = Gtk.Box(spacing=0)
+        lbl = Gtk.Label(label="wayscreen")
+        lbl.get_style_context().add_class("section-label")
+        lbl.props.xalign = 0
+        top.pack_start(lbl, False, False, 0)
         btn = Gtk.Button(label="\u2715")
         btn.set_relief(Gtk.ReliefStyle.NONE)
         btn.connect("clicked", lambda *a: Gtk.main_quit())
@@ -102,9 +262,19 @@ scale slider { min-width: 14px; min-height: 14px; border-radius: 7px;
         body = Gtk.Box(spacing=10)
         vbox.pack_start(body, True, True, 0)
 
-        sliders_vb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        svb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
 
-        def make_row(icon, label_text, scale, val_label, fmt_cb, dbus_prop, dbus_type, dbus_conv):
+        self._save_timer = None
+
+        def make_on_change(prop, sig, conv, lbl, fmt):
+            def on_change(scale):
+                v = scale.get_value()
+                lbl.set_text(fmt(v))
+                set_val(prop, sig, conv(v))
+                self._schedule_save()
+            return on_change
+
+        def make_row(icon, label_text, scale, val_lbl, fmt_cb):
             vb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
             h = Gtk.Box(spacing=8)
             l = Gtk.Label(label=f"{icon} {label_text}")
@@ -114,46 +284,201 @@ scale slider { min-width: 14px; min-height: 14px; border-radius: 7px;
             h.pack_start(scale, True, True, 0)
             vb.pack_start(h, False, False, 0)
             vh = Gtk.Box(spacing=0)
-            vh.pack_end(val_label, False, False, 0)
-            val_label.get_style_context().add_class("val-label")
+            vh.pack_end(val_lbl, False, False, 0)
+            val_lbl.get_style_context().add_class("val-label")
             vb.pack_start(vh, False, False, 0)
-            def on_change(s):
-                v = s.get_value()
-                val_label.set_text(fmt_cb(v))
-                set_val(dbus_prop, dbus_type, dbus_conv(v))
-            scale.connect("value-changed", on_change)
             return vb
 
         self.bv = Gtk.Label(label=f"{b*100:.0f}%")
-        self.sb = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
-        self.sb.set_value(b * 100)
-        sliders_vb.pack_start(make_row("\uF185", "Brilho", self.sb, self.bv,
-            lambda v: f"{v:.0f}%", "Brightness", "d", lambda v: v / 100.0),
-            False, False, 0)
+        sb = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
+        sb.set_value(b * 100)
+        sb.connect("value-changed", make_on_change(
+            "Brightness", "d", lambda v: v/100.0,
+            self.bv, lambda v: f"{v:.0f}%"))
+        svb.pack_start(make_row("\uF185", "Brilho", sb, self.bv,
+            lambda v: f"{v:.0f}%"), False, False, 0)
 
         self.tv = Gtk.Label(label=f"{t}K")
-        self.st = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 1000, 10000, 50)
-        self.st.set_value(t)
-        sliders_vb.pack_start(make_row("\uF2C9", "Temperatura", self.st, self.tv,
-            lambda v: f"{v:.0f}K", "Temperature", "q", lambda v: int(v)),
-            False, False, 0)
+        st = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 1000, 10000, 50)
+        st.set_value(t)
+        st.connect("value-changed", make_on_change(
+            "Temperature", "q", lambda v: int(v),
+            self.tv, lambda v: f"{v:.0f}K"))
+        # Temp row with Auto button
+        temp_vb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        temp_h = Gtk.Box(spacing=8)
+        temp_l = Gtk.Label(label="\uF2C9 Temp.")
+        temp_l.set_width_chars(13); temp_l.set_xalign(0)
+        st.set_draw_value(False)
+        temp_h.pack_start(temp_l, False, False, 0)
+        temp_h.pack_start(st, True, True, 0)
+        temp_vb.pack_start(temp_h, False, False, 0)
+        temp_vh = Gtk.Box(spacing=0)
+        temp_vh.pack_end(self.tv, False, False, 0)
+        self._auto_btn = Gtk.Button(label="Auto")
+        self._auto_btn.get_style_context().add_class("auto-btn")
+        self._auto_btn.connect("clicked", self._on_auto_temp)
+        temp_vh.pack_end(self._auto_btn, False, False, 4)
+        self.tv.get_style_context().add_class("val-label")
+        temp_vb.pack_start(temp_vh, False, False, 0)
+        svb.pack_start(temp_vb, False, False, 0)
 
         self.gv = Gtk.Label(label=f"{g:.2f}")
-        self.sg = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 50, 300, 1)
-        self.sg.set_value(g * 100)
-        sliders_vb.pack_start(make_row("\uF5DC", "Gamma", self.sg, self.gv,
-            lambda v: f"{v/100:.2f}", "Gamma", "d", lambda v: v / 100.0),
-            False, False, 0)
+        sg = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 50, 300, 1)
+        sg.set_value(g * 100)
+        sg.connect("value-changed", make_on_change(
+            "Gamma", "d", lambda v: v/100.0,
+            self.gv, lambda v: f"{v/100:.2f}"))
+        svb.pack_start(make_row("\uF5DC", "Gamma", sg, self.gv,
+            lambda v: f"{v/100:.2f}"), False, False, 0)
 
-        body.pack_start(sliders_vb, True, True, 0)
+        # Profile section
+        profile_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        profile_box.set_margin_top(8)
+        plbl = Gtk.Label(label="\uF2C0 Profile")
+        plbl.get_style_context().add_class("section-label")
+        plbl.props.xalign = 0
+        profile_box.pack_start(plbl, False, False, 0)
+
+        ph = Gtk.Box(spacing=6)
+        self.profile_combo = Gtk.ComboBoxText.new_with_entry()
+        self.profile_combo.set_entry_text_column(0)
+        self._refresh_profiles()
+        ph.pack_start(self.profile_combo, True, True, 0)
+
+        save_btn = Gtk.Button(label="Salvar")
+        save_btn.get_style_context().add_class("profile-btn")
+        save_btn.connect("clicked", self._on_save_profile)
+        ph.pack_start(save_btn, False, False, 0)
+
+        del_btn = Gtk.Button(label="Deletar")
+        del_btn.get_style_context().add_class("profile-btn")
+        del_btn.connect("clicked", self._on_delete_profile)
+        ph.pack_start(del_btn, False, False, 0)
+
+        profile_box.pack_start(ph, False, False, 0)
+        svb.pack_start(profile_box, False, False, 0)
+
+        body.pack_start(svb, True, True, 0)
         body.pack_start(CalibArea(), False, False, 0)
 
         self.connect("key-press-event", self._on_key)
 
+        # Store slider refs for profile load
+        self._sb = sb
+        self._st = st
+        self._sg = sg
+
+    def _schedule_save(self):
+        if self._save_timer:
+            GLib.source_remove(self._save_timer)
+        self._save_timer = GLib.timeout_add(300, self._do_save)
+
+    def _do_save(self):
+        self._save_timer = None
+        vals = read_current()
+        save_config(vals)
+        return GLib.SOURCE_REMOVE
+
+    def _current_values(self):
+        return {
+            "Brightness": float(get_val("Brightness") or DEFAULTS["Brightness"]),
+            "Temperature": int(float(get_val("Temperature") or DEFAULTS["Temperature"])),
+            "Gamma": float(get_val("Gamma") or DEFAULTS["Gamma"]),
+        }
+
+    def _refresh_profiles(self):
+        self.profile_combo.remove_all()
+        for name in list_profiles():
+            self.profile_combo.append_text(name)
+
+    def _on_save_profile(self, btn):
+        entry = self.profile_combo.get_child()
+        name = entry.get_text().strip()
+        if not name:
+            return
+        vals = self._current_values()
+        save_profile(name, vals)
+        self._refresh_profiles()
+        entry.set_text(name)
+
+    def _on_delete_profile(self, btn):
+        entry = self.profile_combo.get_child()
+        name = entry.get_text().strip()
+        if not name or name == "default":
+            return
+        delete_profile(name)
+        self._refresh_profiles()
+
+    def _on_load_profile(self, combo):
+        entry = combo.get_child()
+        name = entry.get_text().strip()
+        if not name or name not in list_profiles():
+            return
+        vals = load_profile(name)
+        if not vals:
+            return
+        apply_values(vals)
+
+        if "Brightness" in vals:
+            self._sb.set_value(vals["Brightness"] * 100)
+            self.bv.set_text(f"{vals['Brightness']*100:.0f}%")
+        if "Temperature" in vals:
+            self._st.set_value(vals["Temperature"])
+            self.tv.set_text(f"{vals['Temperature']:.0f}K")
+        if "Gamma" in vals:
+            self._sg.set_value(vals["Gamma"] * 100)
+            self.gv.set_text(f"{vals['Gamma']:.2f}")
+
+    def _on_auto_temp(self, btn):
+        btn.set_sensitive(False)
+        btn.set_label("\u23F3")
+        threading.Thread(target=self._auto_temp_thread, daemon=True).start()
+
+    def _auto_temp_thread(self):
+        try:
+            avg = _capture_avg_rgb()
+            if avg is None:
+                GLib.idle_add(self._on_auto_temp_error, "capture failed")
+                return
+            temp = _estimate_temp(*avg)
+            GLib.idle_add(self._on_auto_temp_done, temp)
+        except Exception as e:
+            GLib.idle_add(self._on_auto_temp_error, str(e))
+
+    def _on_auto_temp_done(self, temp):
+        self._st.set_value(temp)
+        set_val("Temperature", "q", int(temp))
+        self.tv.set_text(f"{temp:.0f}K")
+        self._schedule_save()
+        self._auto_btn.set_label("Auto")
+        self._auto_btn.set_sensitive(True)
+
+    def _on_auto_temp_error(self, msg):
+        self._auto_btn.set_label("Auto")
+        self._auto_btn.set_sensitive(True)
+        print(f"[wayscreen] auto-temp: {msg}")
+
     def _on_key(self, w, e):
         if e.keyval == Gdk.KEY_Escape: Gtk.main_quit()
 
+
 if __name__ == "__main__":
+    if "--apply" in sys.argv:
+        saved = load_config()
+        if saved:
+            apply_values(saved)
+            print("[wayscreen] config applied")
+        else:
+            print("[wayscreen] no saved config found")
+        sys.exit(0)
+
+    # Ensure "default" profile exists
+    if "default" not in list_profiles():
+        save_profile("default", dict(DEFAULTS))
+        print("[wayscreen] default profile created")
+
     win = DisplaySliders()
     win.show_all()
+    win.profile_combo.connect("changed", win._on_load_profile)
     Gtk.main()
