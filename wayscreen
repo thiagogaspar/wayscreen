@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
+import os
+# wayscreen persists via its own JSON config; GSettings/dconf are not used,
+# so keep them in memory to avoid stderr noise when importing Gtk (dconf
+# cannot write e.g. in scripted/CLI contexts).
+os.environ.setdefault("GSETTINGS_BACKEND", "memory")
 import gi
 gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, Gdk, GLib
 import subprocess
 import json
-import os
 import sys
 import threading
 
 BUS = ["busctl", "--user", "set-property", "rs.wl-gammarelay", "/", "rs.wl.gammarelay"]
 BUS_GET = ["busctl", "--user", "get-property", "rs.wl-gammarelay", "/", "rs.wl.gammarelay"]
 
-CONFIG_DIR = os.path.expanduser("~/.config/wayscreen")
+CONFIG_DIR = os.environ.get("WAYSCREEN_CONFIG_DIR") or os.path.expanduser("~/.config/wayscreen")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 PROFILES_DIR = os.path.join(CONFIG_DIR, "profiles")
 
@@ -49,6 +53,35 @@ def apply_values(vals):
         set_val("Gamma", "d", vals["Gamma"])
 
 
+class _Writer:
+    """Coalesce D-Bus writes: during a slider drag, `value-changed` fires many
+    times per second; spawning a `busctl` process per event is wasteful, so
+    pending values are flushed at most once per `delay` seconds per property."""
+
+    def __init__(self, delay=0.06):
+        self.delay = delay
+        self._pending = {}
+        self._timer = None
+
+    def push(self, prop, typ, value):
+        self._pending[prop] = (typ, value)
+        if self._timer is None:
+            self._timer = GLib.timeout_add(int(self.delay * 1000), self._flush)
+
+    def flush_now(self):
+        if self._timer is not None:
+            GLib.source_remove(self._timer)
+            self._timer = None
+        self._flush()
+
+    def _flush(self):
+        self._timer = None
+        for prop, (typ, value) in self._pending.items():
+            set_val(prop, typ, value)
+        self._pending.clear()
+        return GLib.SOURCE_REMOVE
+
+
 def load_config():
     if not os.path.exists(CONFIG_FILE):
         return {}
@@ -60,8 +93,8 @@ def load_config():
 
 
 def save_config(vals):
-    os.makedirs(CONFIG_DIR, exist_ok=True)
     try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
         with open(CONFIG_FILE, "w") as f:
             json.dump(vals, f, indent=2)
     except OSError:
@@ -79,9 +112,9 @@ def list_profiles():
 
 
 def save_profile(name, vals):
-    os.makedirs(PROFILES_DIR, exist_ok=True)
     path = os.path.join(PROFILES_DIR, f"{name}.json")
     try:
+        os.makedirs(PROFILES_DIR, exist_ok=True)
         with open(path, "w") as f:
             json.dump(vals, f, indent=2)
     except OSError:
@@ -265,16 +298,17 @@ scale slider { min-width: 12px; min-height: 12px; border-radius: 6px;
         svb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
 
         self._save_timer = None
+        self._writer = _Writer()
 
         def make_on_change(prop, sig, conv, lbl, fmt):
             def on_change(scale):
                 v = scale.get_value()
                 lbl.set_text(fmt(v))
-                set_val(prop, sig, conv(v))
+                self._writer.push(prop, sig, conv(v))
                 self._schedule_save()
             return on_change
 
-        def make_row(icon, label_text, scale, val_lbl, fmt_cb):
+        def make_row(icon, label_text, scale, val_lbl):
             vb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
             h = Gtk.Box(spacing=8)
             l = Gtk.Label(label=f"{icon} {label_text}")
@@ -295,8 +329,7 @@ scale slider { min-width: 12px; min-height: 12px; border-radius: 6px;
         sb.connect("value-changed", make_on_change(
             "Brightness", "d", lambda v: v/100.0,
             self.bv, lambda v: f"{v:.0f}%"))
-        svb.pack_start(make_row("\uF185", "Brilho", sb, self.bv,
-            lambda v: f"{v:.0f}%"), False, False, 0)
+        svb.pack_start(make_row("\uF185", "Brilho", sb, self.bv), False, False, 0)
 
         self.tv = Gtk.Label(label=f"{t}K")
         st = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 1000, 10000, 50)
@@ -329,8 +362,7 @@ scale slider { min-width: 12px; min-height: 12px; border-radius: 6px;
         sg.connect("value-changed", make_on_change(
             "Gamma", "d", lambda v: v/100.0,
             self.gv, lambda v: f"{v/100:.2f}"))
-        svb.pack_start(make_row("\uF5DC", "Gamma", sg, self.gv,
-            lambda v: f"{v/100:.2f}"), False, False, 0)
+        svb.pack_start(make_row("\uF5DC", "Gamma", sg, self.gv), False, False, 0)
 
         # Profile section
         profile_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
@@ -363,6 +395,7 @@ scale slider { min-width: 12px; min-height: 12px; border-radius: 6px;
         body.pack_start(CalibArea(), False, False, 0)
 
         self.connect("key-press-event", self._on_key)
+        self.connect("destroy", lambda *a: self._writer.flush_now())
 
         # Store slider refs for profile load
         self._sb = sb
@@ -463,6 +496,69 @@ scale slider { min-width: 12px; min-height: 12px; border-radius: 6px;
         if e.keyval == Gdk.KEY_Escape: Gtk.main_quit()
 
 
+def _print_status():
+    v = read_current()
+    print(f"brightness={v['Brightness']*100:.0f}%")
+    print(f"temperature={v['Temperature']}K")
+    print(f"gamma={v['Gamma']:.3f}")
+
+
+_PROP_ALIASES = {"brightness": "Brightness", "temperature": "Temperature", "gamma": "Gamma"}
+
+
+def _cli_mode():
+    """Handle non-GUI invocations (--status/--get/--set). Return an exit code,
+    or None when the GUI should start instead."""
+    args = sys.argv[1:]
+
+    if "--status" in args:
+        _print_status()
+        return 0
+
+    if "--get" in args:
+        i = args.index("--get")
+        if i + 1 >= len(args):
+            print("[wayscreen] usage: --get brightness|temperature|gamma", file=sys.stderr)
+            return 2
+        key = _PROP_ALIASES.get(args[i + 1].lower())
+        if key is None:
+            print(f"[wayscreen] unknown property: {args[i+1]}", file=sys.stderr)
+            return 2
+        v = read_current()[key]
+        if key == "Brightness":
+            print(f"{v*100:.0f}%")
+        elif key == "Temperature":
+            print(f"{v}K")
+        else:
+            print(f"{v:.3f}")
+        return 0
+
+    if "--set" in args:
+        i = args.index("--set")
+        if i + 1 >= len(args):
+            print("[wayscreen] usage: --set brightness=50|temperature=4000|gamma=1.2", file=sys.stderr)
+            return 2
+        prop, _, raw = args[i + 1].partition("=")
+        key = _PROP_ALIASES.get(prop.lower())
+        if key is None:
+            print(f"[wayscreen] unknown property: {prop}", file=sys.stderr)
+            return 2
+        try:
+            if key == "Brightness":
+                set_val("Brightness", "d", max(0.0, min(100.0, float(raw))) / 100.0)
+            elif key == "Temperature":
+                set_val("Temperature", "q", max(1000, min(10000, int(raw))))
+            else:
+                set_val("Gamma", "d", max(0.5, min(3.0, float(raw))))
+        except ValueError:
+            print(f"[wayscreen] invalid value: {raw}", file=sys.stderr)
+            return 2
+        _print_status()
+        return 0
+
+    return None
+
+
 if __name__ == "__main__":
     if "--apply" in sys.argv:
         saved = load_config()
@@ -472,6 +568,10 @@ if __name__ == "__main__":
         else:
             print("[wayscreen] no saved config found")
         sys.exit(0)
+
+    code = _cli_mode()
+    if code is not None:
+        sys.exit(code)
 
     # Ensure "default" profile exists
     if "default" not in list_profiles():

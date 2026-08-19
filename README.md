@@ -26,6 +26,25 @@ Designed as a Waybar click-to-open menu.
 ./wayscreen
 ```
 
+### Command-line interface
+
+Sem abrir a UI, para scripts, keybinds e Waybar:
+
+```bash
+./wayscreen --status                # estado atual
+./wayscreen --get temperature       # valor individual (brightness|temperature|gamma)
+./wayscreen --set brightness=50     # escreve e imprime o novo estado
+./wayscreen --set temperature=4000
+./wayscreen --set gamma=1.2
+```
+
+Exemplo de keybind no Hyprland:
+
+```ini
+bind = SUPER, F5, exec, /path/to/wayscreen --set brightness=80
+bind = SUPER, F6, exec, /path/to/wayscreen --status
+```
+
 ### Persistência (autostart)
 
 Para restaurar a última config na inicialização sem abrir a UI:
@@ -56,3 +75,10 @@ Add to your `~/.config/waybar/config.jsonc`:
 
 - Config: `~/.config/wayscreen/config.json`
 - Profiles: `~/.config/wayscreen/profiles/<name>.json`
+- Override com `WAYSCREEN_CONFIG_DIR=/path` (útil para testes/portabilidade)
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests -v
+```
