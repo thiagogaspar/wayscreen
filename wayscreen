@@ -30,7 +30,8 @@ def get_val(prop):
 
 
 def set_val(prop, typ, val):
-    subprocess.run([*BUS, prop, typ, str(val)], capture_output=True)
+    r = subprocess.run([*BUS, prop, typ, str(val)], capture_output=True)
+    return r.returncode
 
 
 def read_current():
@@ -288,7 +289,7 @@ scale slider { min-width: 12px; min-height: 12px; border-radius: 6px;
         top.pack_start(lbl, False, False, 0)
         btn = Gtk.Button(label="\u2715")
         btn.set_relief(Gtk.ReliefStyle.NONE)
-        btn.connect("clicked", lambda *a: Gtk.main_quit())
+        btn.connect("clicked", self._quit)
         top.pack_end(btn, False, False, 0)
         vbox.pack_start(top, False, False, 0)
 
@@ -451,7 +452,6 @@ scale slider { min-width: 12px; min-height: 12px; border-radius: 6px;
         vals = load_profile(name)
         if not vals:
             return
-        apply_values(vals)
 
         if "Brightness" in vals:
             self._sb.set_value(vals["Brightness"] * 100)
@@ -462,6 +462,10 @@ scale slider { min-width: 12px; min-height: 12px; border-radius: 6px;
         if "Gamma" in vals:
             self._sg.set_value(vals["Gamma"] * 100)
             self.gv.set_text(f"{vals['Gamma']:.2f}")
+        # Slider set_value() already queued the writes via value-changed;
+        # flush them now so the profile takes effect immediately (no duplicate
+        # apply_values + writer flush).
+        self._writer.flush_now()
 
     def _on_auto_temp(self, btn):
         btn.set_sensitive(False)
@@ -481,7 +485,7 @@ scale slider { min-width: 12px; min-height: 12px; border-radius: 6px;
 
     def _on_auto_temp_done(self, temp):
         self._st.set_value(temp)
-        set_val("Temperature", "q", int(temp))
+        self._writer.flush_now()
         self.tv.set_text(f"{temp:.0f}K")
         self._schedule_save()
         self._auto_btn.set_label("Auto")
@@ -493,67 +497,129 @@ scale slider { min-width: 12px; min-height: 12px; border-radius: 6px;
         print(f"[wayscreen] auto-temp: {msg}")
 
     def _on_key(self, w, e):
-        if e.keyval == Gdk.KEY_Escape: Gtk.main_quit()
+        if e.keyval == Gdk.KEY_Escape:
+            self._quit()
+
+    def _quit(self, *a):
+        self._writer.flush_now()
+        Gtk.main_quit()
 
 
-def _print_status():
-    v = read_current()
+_USAGE = """wayscreen - calibracao de display via wl-gammarelay
+
+Uso:
+  wayscreen                     abre a interface GTK
+  wayscreen --status            mostra o estado atual
+  wayscreen --get <prop>        le uma propriedade (brightness|temperature|gamma)
+  wayscreen --set <prop>=<val>  define e mostra o novo estado
+  wayscreen --apply             aplica a ultima config salva
+
+Valores: brightness=0-100 (%), temperature=1000-10000 (K), gamma=0.5-3.0"""
+
+_PROP_ALIASES = {"brightness": "Brightness", "temperature": "Temperature", "gamma": "Gamma"}
+
+
+def _strict_read():
+    """Read current values, returning None (with an error printed) when the
+    wl-gammarelay daemon is unreachable — the CLI must not fabricate values."""
+    b, t, g = get_val("Brightness"), get_val("Temperature"), get_val("Gamma")
+    if None in (b, t, g):
+        print("[wayscreen] erro: wl-gammarelay inacessivel (servico parado?)", file=sys.stderr)
+        return None
+    return {"Brightness": float(b), "Temperature": int(float(t)), "Gamma": float(g)}
+
+
+def _print_status(v):
     print(f"brightness={v['Brightness']*100:.0f}%")
     print(f"temperature={v['Temperature']}K")
     print(f"gamma={v['Gamma']:.3f}")
 
 
-_PROP_ALIASES = {"brightness": "Brightness", "temperature": "Temperature", "gamma": "Gamma"}
-
-
 def _cli_mode():
-    """Handle non-GUI invocations (--status/--get/--set). Return an exit code,
-    or None when the GUI should start instead."""
+    """Handle non-GUI invocations. Return an exit code, or None when the GUI
+    should start instead."""
     args = sys.argv[1:]
+    if not args:
+        return None
+
+    known = {"--help", "--status", "--get", "--set", "--apply"}
+    bad = [a for a in args if a.startswith("--") and a not in known]
+    value_args = set()
+    for flag in ("--get", "--set"):
+        if flag in args:
+            j = args.index(flag)
+            if j + 1 < len(args):
+                value_args.add(args[j + 1])
+    positional = [a for a in args if not a.startswith("--") and a not in value_args]
+    if bad or positional:
+        print(f"[wayscreen] argumentos desconhecidos: {' '.join(bad + positional)}",
+              file=sys.stderr)
+        print(_USAGE, file=sys.stderr)
+        return 2
+    if "--help" in args:
+        print(_USAGE)
+        return 0
+    if "--get" in args and "--set" in args:
+        print("[wayscreen] use apenas um de --get/--set por chamada", file=sys.stderr)
+        return 2
 
     if "--status" in args:
-        _print_status()
+        v = _strict_read()
+        if v is None:
+            return 1
+        _print_status(v)
         return 0
 
     if "--get" in args:
         i = args.index("--get")
         if i + 1 >= len(args):
-            print("[wayscreen] usage: --get brightness|temperature|gamma", file=sys.stderr)
+            print("[wayscreen] uso: --get brightness|temperature|gamma", file=sys.stderr)
             return 2
         key = _PROP_ALIASES.get(args[i + 1].lower())
         if key is None:
-            print(f"[wayscreen] unknown property: {args[i+1]}", file=sys.stderr)
+            print(f"[wayscreen] propriedade desconhecida: {args[i+1]}", file=sys.stderr)
             return 2
-        v = read_current()[key]
+        v = _strict_read()
+        if v is None:
+            return 1
+        val = v[key]
         if key == "Brightness":
-            print(f"{v*100:.0f}%")
+            print(f"{val*100:.0f}%")
         elif key == "Temperature":
-            print(f"{v}K")
+            print(f"{val}K")
         else:
-            print(f"{v:.3f}")
+            print(f"{val:.3f}")
         return 0
 
     if "--set" in args:
         i = args.index("--set")
         if i + 1 >= len(args):
-            print("[wayscreen] usage: --set brightness=50|temperature=4000|gamma=1.2", file=sys.stderr)
+            print("[wayscreen] uso: --set brightness=50|temperature=4000|gamma=1.2",
+                  file=sys.stderr)
             return 2
         prop, _, raw = args[i + 1].partition("=")
         key = _PROP_ALIASES.get(prop.lower())
         if key is None:
-            print(f"[wayscreen] unknown property: {prop}", file=sys.stderr)
+            print(f"[wayscreen] propriedade desconhecida: {prop}", file=sys.stderr)
             return 2
         try:
             if key == "Brightness":
-                set_val("Brightness", "d", max(0.0, min(100.0, float(raw))) / 100.0)
+                rc = set_val("Brightness", "d", max(0.0, min(100.0, float(raw))) / 100.0)
             elif key == "Temperature":
-                set_val("Temperature", "q", max(1000, min(10000, int(raw))))
+                rc = set_val("Temperature", "q", max(1000, min(10000, int(raw))))
             else:
-                set_val("Gamma", "d", max(0.5, min(3.0, float(raw))))
+                rc = set_val("Gamma", "d", max(0.5, min(3.0, float(raw))))
         except ValueError:
-            print(f"[wayscreen] invalid value: {raw}", file=sys.stderr)
+            print(f"[wayscreen] valor invalido: {raw}", file=sys.stderr)
             return 2
-        _print_status()
+        if rc != 0:
+            print("[wayscreen] erro ao aplicar valor (wl-gammarelay inacessivel?)",
+                  file=sys.stderr)
+            return 1
+        v = _strict_read()
+        if v is None:
+            return 1
+        _print_status(v)
         return 0
 
     return None

@@ -169,7 +169,10 @@ class TestCli(unittest.TestCase):
     def test_set_clamps_out_of_range_values(self):
         calls = []
         original = ws.set_val
-        ws.set_val = lambda prop, typ, val: calls.append((prop, typ, val))
+        def fake_set_val(prop, typ, val):
+            calls.append((prop, typ, val))
+            return 0
+        ws.set_val = fake_set_val
         self.addCleanup(setattr, ws, "set_val", original)
 
         self.assertEqual(self._run(["wayscreen", "--set", "brightness=500"]), 0)
@@ -180,6 +183,28 @@ class TestCli(unittest.TestCase):
             ("Temperature", "q", 10000),
             ("Gamma", "d", 3.0),
         ])
+
+    def test_set_reports_failed_write(self):
+        original = ws.set_val
+        ws.set_val = lambda prop, typ, val: 1  # busctl would fail
+        self.addCleanup(setattr, ws, "set_val", original)
+        self.assertEqual(self._run(["wayscreen", "--set", "brightness=50"]), 1)
+
+    def test_unknown_flag_rejected(self):
+        self.assertEqual(self._run(["wayscreen", "--frobnicate"]), 2)
+
+    def test_positional_junk_rejected(self):
+        self.assertEqual(self._run(["wayscreen", "hello"]), 2)
+
+    def test_get_and_set_together_rejected(self):
+        self.assertEqual(
+            self._run(["wayscreen", "--get", "gamma", "--set", "temperature=4000"]), 2)
+
+    def test_help_prints_usage(self):
+        self.assertEqual(self._run(["wayscreen", "--help"]), 0)
+
+    def test_set_missing_value_rejected(self):
+        self.assertEqual(self._run(["wayscreen", "--set"]), 2)
 
 
 if __name__ == "__main__":
