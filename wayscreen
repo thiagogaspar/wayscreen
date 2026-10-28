@@ -12,8 +12,11 @@ import json
 import sys
 import threading
 
-BUS = ["busctl", "--user", "set-property", "rs.wl-gammarelay", "/", "rs.wl.gammarelay"]
-BUS_GET = ["busctl", "--user", "get-property", "rs.wl-gammarelay", "/", "rs.wl.gammarelay"]
+BUS_NAME = "rs.wl-gammarelay"
+BUS_INTERFACE = "rs.wl.gammarelay"
+
+# Scope name used for the D-Bus "/" object, which broadcasts to every monitor.
+GLOBAL_SCOPE = "global"
 
 CONFIG_DIR = os.environ.get("WAYSCREEN_CONFIG_DIR") or os.path.expanduser("~/.config/wayscreen")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
@@ -21,37 +24,61 @@ PROFILES_DIR = os.path.join(CONFIG_DIR, "profiles")
 
 DEFAULTS = {"Brightness": 1.0, "Temperature": 6500, "Gamma": 1.0}
 
+_PROP_KEYS = ("Brightness", "Temperature", "Gamma")
 
-def get_val(prop):
-    r = subprocess.run([*BUS_GET, prop], capture_output=True, text=True)
+
+def output_path(monitor=None):
+    """D-Bus object path for a monitor scope. None/"global" means every
+    monitor; otherwise wl-gammarelay exposes each output under /outputs/<name>,
+    with dashes in the Hyprland name replaced by underscores (eDP-1 -> eDP_1)."""
+    if not monitor or monitor == GLOBAL_SCOPE:
+        return "/"
+    return "/outputs/" + str(monitor).replace("-", "_")
+
+
+def list_outputs():
+    """Names of the connected monitors, as reported by Hyprland."""
+    r = subprocess.run(["hyprctl", "monitors", "-j"], capture_output=True, text=True)
+    if r.returncode != 0:
+        return []
+    try:
+        return [m["name"] for m in json.loads(r.stdout) if m.get("name")]
+    except (json.JSONDecodeError, TypeError, KeyError):
+        return []
+
+
+def get_val(prop, monitor=None):
+    cmd = ["busctl", "--user", "get-property", BUS_NAME, output_path(monitor), BUS_INTERFACE]
+    r = subprocess.run([*cmd, prop], capture_output=True, text=True)
     if r.returncode != 0: return None
     parts = r.stdout.strip().split()
     return parts[1] if len(parts) > 1 else None
 
 
-def set_val(prop, typ, val):
-    r = subprocess.run([*BUS, prop, typ, str(val)], capture_output=True)
+def set_val(prop, typ, val, monitor=None):
+    cmd = ["busctl", "--user", "set-property", BUS_NAME, output_path(monitor), BUS_INTERFACE]
+    r = subprocess.run([*cmd, prop, typ, str(val)], capture_output=True)
     return r.returncode
 
 
-def read_current():
+def read_current(monitor=None):
     vals = {}
-    b = get_val("Brightness")
+    b = get_val("Brightness", monitor)
     vals["Brightness"] = float(b) if b else DEFAULTS["Brightness"]
-    t = get_val("Temperature")
+    t = get_val("Temperature", monitor)
     vals["Temperature"] = int(t) if t else DEFAULTS["Temperature"]
-    g = get_val("Gamma")
+    g = get_val("Gamma", monitor)
     vals["Gamma"] = float(g) if g else DEFAULTS["Gamma"]
     return vals
 
 
-def apply_values(vals):
+def apply_values(vals, monitor=None):
     if "Brightness" in vals:
-        set_val("Brightness", "d", vals["Brightness"])
+        set_val("Brightness", "d", vals["Brightness"], monitor)
     if "Temperature" in vals:
-        set_val("Temperature", "q", int(vals["Temperature"]))
+        set_val("Temperature", "q", int(vals["Temperature"]), monitor)
     if "Gamma" in vals:
-        set_val("Gamma", "d", vals["Gamma"])
+        set_val("Gamma", "d", vals["Gamma"], monitor)
 
 
 class _Writer:
@@ -59,7 +86,8 @@ class _Writer:
     times per second; spawning a `busctl` process per event is wasteful, so
     pending values are flushed at most once per `delay` seconds per property."""
 
-    def __init__(self, delay=0.06):
+    def __init__(self, monitor=None, delay=0.06):
+        self.monitor = monitor
         self.delay = delay
         self._pending = {}
         self._timer = None
@@ -78,26 +106,51 @@ class _Writer:
     def _flush(self):
         self._timer = None
         for prop, (typ, value) in self._pending.items():
-            set_val(prop, typ, value)
+            if self.monitor and self.monitor != GLOBAL_SCOPE:
+                set_val(prop, typ, value, self.monitor)
+            else:
+                # Keep the historical 3-arg call for the global scope.
+                set_val(prop, typ, value)
         self._pending.clear()
         return GLib.SOURCE_REMOVE
 
 
+def empty_config():
+    return {"selected": GLOBAL_SCOPE, "monitors": {}}
+
+
+def _migrate_config(raw):
+    """Accept the current structure, and upgrade the legacy flat format
+    (a bare {Brightness, Temperature, Gamma} dict) to a global scope."""
+    if not isinstance(raw, dict):
+        return empty_config()
+    if isinstance(raw.get("monitors"), dict):
+        cfg = empty_config()
+        cfg["selected"] = raw.get("selected") or GLOBAL_SCOPE
+        cfg["monitors"] = raw["monitors"]
+        return cfg
+    if any(k in raw for k in _PROP_KEYS):
+        cfg = empty_config()
+        cfg["monitors"][GLOBAL_SCOPE] = {k: raw[k] for k in _PROP_KEYS if k in raw}
+        return cfg
+    return empty_config()
+
+
 def load_config():
     if not os.path.exists(CONFIG_FILE):
-        return {}
+        return empty_config()
     try:
         with open(CONFIG_FILE) as f:
-            return json.load(f)
+            return _migrate_config(json.load(f))
     except (json.JSONDecodeError, OSError):
-        return {}
+        return empty_config()
 
 
-def save_config(vals):
+def save_config(cfg):
     try:
         os.makedirs(CONFIG_DIR, exist_ok=True)
         with open(CONFIG_FILE, "w") as f:
-            json.dump(vals, f, indent=2)
+            json.dump(cfg, f, indent=2)
     except OSError:
         pass
 
@@ -266,14 +319,23 @@ scale slider { min-width: 12px; min-height: 12px; border-radius: 6px;
         Gtk.StyleContext.add_provider_for_screen(screen, provider,
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
-        # Apply saved config on startup
+        # Restore the saved values for every monitor, then select the last one
+        # used (falling back to the global scope).
         saved = load_config()
-        if saved:
-            apply_values(saved)
+        self._saved_monitors = saved.get("monitors", {})
+        for scope, vals in self._saved_monitors.items():
+            apply_values(vals, None if scope == GLOBAL_SCOPE else scope)
 
-        b = float(get_val("Brightness") or DEFAULTS["Brightness"])
-        t = int(float(get_val("Temperature") or DEFAULTS["Temperature"]))
-        g = float(get_val("Gamma") or DEFAULTS["Gamma"])
+        self._outputs = list_outputs()
+        self._monitor_scopes = [GLOBAL_SCOPE] + self._outputs
+        self._monitor = saved.get("selected") or GLOBAL_SCOPE
+        if self._monitor not in self._monitor_scopes:
+            self._monitor = GLOBAL_SCOPE
+
+        live = read_current(self._monitor)
+        b = float(live["Brightness"])
+        t = int(live["Temperature"])
+        g = float(live["Gamma"])
 
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         vbox.set_margin_top(6)
@@ -298,11 +360,28 @@ scale slider { min-width: 12px; min-height: 12px; border-radius: 6px;
 
         svb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
 
+        # Monitor scope selector: "Todos" applies to every display through the
+        # global D-Bus object, the named entries target a single monitor.
+        self._monitor_combo = Gtk.ComboBoxText()
+        for scope in self._monitor_scopes:
+            self._monitor_combo.append_text("Todos (global)" if scope == GLOBAL_SCOPE else scope)
+        self._monitor_combo.set_active(self._monitor_scopes.index(self._monitor))
+        self._monitor_combo.connect("changed", self._on_monitor_changed)
+        mon_row = Gtk.Box(spacing=8)
+        mon_lbl = Gtk.Label(label="\U000F037A Monitor")
+        mon_lbl.set_width_chars(13); mon_lbl.set_xalign(0)
+        mon_row.pack_start(mon_lbl, False, False, 0)
+        mon_row.pack_start(self._monitor_combo, True, True, 0)
+        svb.pack_start(mon_row, False, False, 0)
+
         self._save_timer = None
-        self._writer = _Writer()
+        self._loading = False
+        self._writer = _Writer(monitor=self._monitor)
 
         def make_on_change(prop, sig, conv, lbl, fmt):
             def on_change(scale):
+                if self._loading:
+                    return
                 v = scale.get_value()
                 lbl.set_text(fmt(v))
                 self._writer.push(prop, sig, conv(v))
@@ -410,16 +489,46 @@ scale slider { min-width: 12px; min-height: 12px; border-radius: 6px;
 
     def _do_save(self):
         self._save_timer = None
-        vals = read_current()
-        save_config(vals)
+        cfg = load_config()
+        cfg["selected"] = self._monitor
+        cfg.setdefault("monitors", {})
+        entry = cfg["monitors"].get(self._monitor, {})
+        entry.update(read_current(self._monitor))
+        cfg["monitors"][self._monitor] = entry
+        save_config(cfg)
         return GLib.SOURCE_REMOVE
 
     def _current_values(self):
-        return {
-            "Brightness": float(get_val("Brightness") or DEFAULTS["Brightness"]),
-            "Temperature": int(float(get_val("Temperature") or DEFAULTS["Temperature"])),
-            "Gamma": float(get_val("Gamma") or DEFAULTS["Gamma"]),
-        }
+        return read_current(self._monitor)
+
+    def _set_sliders(self, vals):
+        """Move the sliders to `vals` without emitting writes."""
+        self._loading = True
+        if "Brightness" in vals:
+            self._sb.set_value(float(vals["Brightness"]) * 100)
+            self.bv.set_text(f"{float(vals['Brightness'])*100:.0f}%")
+        if "Temperature" in vals:
+            self._st.set_value(float(vals["Temperature"]))
+            self.tv.set_text(f"{int(float(vals['Temperature']))}K")
+        if "Gamma" in vals:
+            self._sg.set_value(float(vals["Gamma"]) * 100)
+            self.gv.set_text(f"{float(vals['Gamma']):.2f}")
+        self._loading = False
+
+    def _select_monitor(self, name):
+        self._writer.flush_now()
+        self._monitor = name
+        self._writer.monitor = name
+        self._set_sliders(read_current(name))
+        self._schedule_save()
+
+    def _on_monitor_changed(self, combo):
+        idx = combo.get_active()
+        if idx < 0 or idx >= len(self._monitor_scopes):
+            return
+        name = self._monitor_scopes[idx]
+        if name != self._monitor:
+            self._select_monitor(name)
 
     def _refresh_profiles(self):
         self.profile_combo.remove_all()
@@ -453,19 +562,12 @@ scale slider { min-width: 12px; min-height: 12px; border-radius: 6px;
         if not vals:
             return
 
-        if "Brightness" in vals:
-            self._sb.set_value(vals["Brightness"] * 100)
-            self.bv.set_text(f"{vals['Brightness']*100:.0f}%")
-        if "Temperature" in vals:
-            self._st.set_value(vals["Temperature"])
-            self.tv.set_text(f"{vals['Temperature']:.0f}K")
-        if "Gamma" in vals:
-            self._sg.set_value(vals["Gamma"] * 100)
-            self.gv.set_text(f"{vals['Gamma']:.2f}")
-        # Slider set_value() already queued the writes via value-changed;
-        # flush them now so the profile takes effect immediately (no duplicate
-        # apply_values + writer flush).
+        self._set_sliders(vals)
+        # Sliders were moved with writes suppressed, so apply the profile to the
+        # selected monitor explicitly.
+        apply_values(vals, self._monitor)
         self._writer.flush_now()
+        self._schedule_save()
 
     def _on_auto_temp(self, btn):
         btn.set_sensitive(False)
@@ -513,23 +615,36 @@ Uso:
   wayscreen --get <prop>        le uma propriedade (brightness|temperature|gamma)
   wayscreen --set <prop>=<val>  define e mostra o novo estado
   wayscreen --apply             aplica a ultima config salva
+  wayscreen --list-outputs      lista os monitores disponiveis
+
+Opcoes:
+  --monitor <nome|global>       monitor alvo (padrao: global / todos)
 
 Valores: brightness=0-100 (%), temperature=1000-10000 (K), gamma=0.5-3.0"""
 
 _PROP_ALIASES = {"brightness": "Brightness", "temperature": "Temperature", "gamma": "Gamma"}
 
 
-def _strict_read():
+def _normalize_monitor(name):
+    if not name:
+        return GLOBAL_SCOPE
+    if name.lower() in ("all", "todos", "global", "*"):
+        return GLOBAL_SCOPE
+    return name
+
+
+def _strict_read(monitor=None):
     """Read current values, returning None (with an error printed) when the
     wl-gammarelay daemon is unreachable — the CLI must not fabricate values."""
-    b, t, g = get_val("Brightness"), get_val("Temperature"), get_val("Gamma")
+    b, t, g = get_val("Brightness", monitor), get_val("Temperature", monitor), get_val("Gamma", monitor)
     if None in (b, t, g):
         print("[wayscreen] erro: wl-gammarelay inacessivel (servico parado?)", file=sys.stderr)
         return None
     return {"Brightness": float(b), "Temperature": int(float(t)), "Gamma": float(g)}
 
 
-def _print_status(v):
+def _print_status(v, monitor=GLOBAL_SCOPE):
+    print(f"monitor={monitor}")
     print(f"brightness={v['Brightness']*100:.0f}%")
     print(f"temperature={v['Temperature']}K")
     print(f"gamma={v['Gamma']:.3f}")
@@ -542,14 +657,15 @@ def _cli_mode():
     if not args:
         return None
 
-    known = {"--help", "--status", "--get", "--set", "--apply"}
-    bad = [a for a in args if a.startswith("--") and a not in known]
+    known = {"--help", "--status", "--get", "--set", "--apply",
+             "--monitor", "--list-outputs"}
     value_args = set()
-    for flag in ("--get", "--set"):
+    for flag in ("--get", "--set", "--monitor"):
         if flag in args:
             j = args.index(flag)
             if j + 1 < len(args):
                 value_args.add(args[j + 1])
+    bad = [a for a in args if a.startswith("--") and a not in known]
     positional = [a for a in args if not a.startswith("--") and a not in value_args]
     if bad or positional:
         print(f"[wayscreen] argumentos desconhecidos: {' '.join(bad + positional)}",
@@ -559,15 +675,29 @@ def _cli_mode():
     if "--help" in args:
         print(_USAGE)
         return 0
+    if "--list-outputs" in args:
+        print(f"{GLOBAL_SCOPE}\ttodos os monitores")
+        for name in list_outputs():
+            print(name)
+        return 0
     if "--get" in args and "--set" in args:
         print("[wayscreen] use apenas um de --get/--set por chamada", file=sys.stderr)
         return 2
 
+    monitor = GLOBAL_SCOPE
+    if "--monitor" in args:
+        i = args.index("--monitor")
+        if i + 1 >= len(args):
+            print("[wayscreen] uso: --monitor <nome|global>", file=sys.stderr)
+            return 2
+        monitor = _normalize_monitor(args[i + 1])
+    scope = None if monitor == GLOBAL_SCOPE else monitor
+
     if "--status" in args:
-        v = _strict_read()
+        v = _strict_read(monitor)
         if v is None:
             return 1
-        _print_status(v)
+        _print_status(v, monitor)
         return 0
 
     if "--get" in args:
@@ -579,7 +709,7 @@ def _cli_mode():
         if key is None:
             print(f"[wayscreen] propriedade desconhecida: {args[i+1]}", file=sys.stderr)
             return 2
-        v = _strict_read()
+        v = _strict_read(monitor)
         if v is None:
             return 1
         val = v[key]
@@ -602,13 +732,17 @@ def _cli_mode():
         if key is None:
             print(f"[wayscreen] propriedade desconhecida: {prop}", file=sys.stderr)
             return 2
+
+        def _apply(p, typ, value):
+            return set_val(p, typ, value, scope) if scope else set_val(p, typ, value)
+
         try:
             if key == "Brightness":
-                rc = set_val("Brightness", "d", max(0.0, min(100.0, float(raw))) / 100.0)
+                rc = _apply("Brightness", "d", max(0.0, min(100.0, float(raw))) / 100.0)
             elif key == "Temperature":
-                rc = set_val("Temperature", "q", max(1000, min(10000, int(raw))))
+                rc = _apply("Temperature", "q", max(1000, min(10000, int(raw))))
             else:
-                rc = set_val("Gamma", "d", max(0.5, min(3.0, float(raw))))
+                rc = _apply("Gamma", "d", max(0.5, min(3.0, float(raw))))
         except ValueError:
             print(f"[wayscreen] valor invalido: {raw}", file=sys.stderr)
             return 2
@@ -616,10 +750,10 @@ def _cli_mode():
             print("[wayscreen] erro ao aplicar valor (wl-gammarelay inacessivel?)",
                   file=sys.stderr)
             return 1
-        v = _strict_read()
+        v = _strict_read(monitor)
         if v is None:
             return 1
-        _print_status(v)
+        _print_status(v, monitor)
         return 0
 
     return None
@@ -627,9 +761,11 @@ def _cli_mode():
 
 if __name__ == "__main__":
     if "--apply" in sys.argv:
-        saved = load_config()
-        if saved:
-            apply_values(saved)
+        cfg = load_config()
+        monitors = cfg.get("monitors", {})
+        if monitors:
+            for name, vals in monitors.items():
+                apply_values(vals, None if name == GLOBAL_SCOPE else name)
             print("[wayscreen] config applied")
         else:
             print("[wayscreen] no saved config found")

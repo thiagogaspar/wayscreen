@@ -7,6 +7,7 @@ Run from the repo root:
 import importlib.machinery
 import importlib.util
 import io
+import json
 import os
 import sys
 import tempfile
@@ -75,27 +76,61 @@ class TestEstimateTemp(unittest.TestCase):
         self.assertLess(cold, warm)
 
 
+class TestOutputPath(unittest.TestCase):
+    def test_global_scopes_map_to_root(self):
+        self.assertEqual(ws.output_path(), "/")
+        self.assertEqual(ws.output_path(None), "/")
+        self.assertEqual(ws.output_path(ws.GLOBAL_SCOPE), "/")
+
+    def test_named_monitor_maps_to_outputs_path(self):
+        self.assertEqual(ws.output_path("eDP-1"), "/outputs/eDP_1")
+        self.assertEqual(ws.output_path("HDMI-A-1"), "/outputs/HDMI_A_1")
+
+
+class TestNormalizeMonitor(unittest.TestCase):
+    def test_aliases_map_to_global(self):
+        for alias in (None, "", "all", "Todos", "GLOBAL", "*"):
+            self.assertEqual(ws._normalize_monitor(alias), ws.GLOBAL_SCOPE)
+
+    def test_named_monitor_is_preserved(self):
+        self.assertEqual(ws._normalize_monitor("eDP-1"), "eDP-1")
+
+
 class TestConfigIO(unittest.TestCase):
     def setUp(self):
         _fresh_dirs(self)
 
+    def test_empty_config_shape(self):
+        self.assertEqual(ws.empty_config(), {"selected": "global", "monitors": {}})
+
     def test_roundtrip(self):
         vals = {"Brightness": 0.42, "Temperature": 4200, "Gamma": 1.3}
-        ws.save_config(vals)
-        self.assertEqual(ws.load_config(), vals)
+        cfg = ws.empty_config()
+        cfg["selected"] = "eDP-1"
+        cfg["monitors"]["eDP-1"] = vals
+        ws.save_config(cfg)
+        self.assertEqual(ws.load_config(), cfg)
+
+    def test_legacy_flat_config_migrates_to_global(self):
+        legacy = {"Brightness": 0.5, "Temperature": 5000, "Gamma": 1.1}
+        with open(os.path.join(ws.CONFIG_DIR, "config.json"), "w") as f:
+            json.dump(legacy, f)
+        cfg = ws.load_config()
+        self.assertEqual(cfg["selected"], "global")
+        self.assertEqual(cfg["monitors"]["global"], legacy)
 
     def test_missing_config_returns_empty(self):
-        self.assertEqual(ws.load_config(), {})
+        self.assertEqual(ws.load_config(), ws.empty_config())
 
     def test_corrupt_config_returns_empty(self):
         with open(os.path.join(ws.CONFIG_DIR, "config.json"), "w") as f:
             f.write("{definitely not json")
-        self.assertEqual(ws.load_config(), {})
+        self.assertEqual(ws.load_config(), ws.empty_config())
 
     def test_unwritable_dir_does_not_raise(self):
         ws.CONFIG_DIR = "/proc/forbidden"
-        ws.save_config({"Brightness": 1.0})  # must not raise
-        self.assertEqual(ws.load_config(), {})
+        ws.save_config(ws.empty_config())  # must not raise
+        self.assertEqual(ws.load_config(), ws.empty_config())
 
 
 class TestProfiles(unittest.TestCase):
@@ -205,6 +240,42 @@ class TestCli(unittest.TestCase):
 
     def test_set_missing_value_rejected(self):
         self.assertEqual(self._run(["wayscreen", "--set"]), 2)
+
+    def test_list_outputs_returns_zero(self):
+        self.assertEqual(self._run(["wayscreen", "--list-outputs"]), 0)
+
+    def test_missing_monitor_value_rejected(self):
+        self.assertEqual(self._run(["wayscreen", "--set", "gamma=1.2", "--monitor"]), 2)
+
+    def test_set_with_monitor_targets_output(self):
+        calls = []
+        original = ws.set_val
+
+        def fake_set_val(prop, typ, val, monitor=None):
+            calls.append((prop, typ, val, monitor))
+            return 0
+
+        ws.set_val = fake_set_val
+        self.addCleanup(setattr, ws, "set_val", original)
+
+        self.assertEqual(
+            self._run(["wayscreen", "--set", "gamma=1.2", "--monitor", "eDP-1"]), 0)
+        self.assertEqual(calls, [("Gamma", "d", 1.2, "eDP-1")])
+
+    def test_set_with_global_alias_targets_all(self):
+        calls = []
+        original = ws.set_val
+
+        def fake_set_val(prop, typ, val, monitor=None):
+            calls.append((prop, typ, val, monitor))
+            return 0
+
+        ws.set_val = fake_set_val
+        self.addCleanup(setattr, ws, "set_val", original)
+
+        self.assertEqual(
+            self._run(["wayscreen", "--set", "temperature=4000", "--monitor", "todos"]), 0)
+        self.assertEqual(calls, [("Temperature", "q", 4000, None)])
 
 
 if __name__ == "__main__":

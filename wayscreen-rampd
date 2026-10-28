@@ -1,0 +1,295 @@
+#!/usr/bin/env python3
+"""wayscreen-rampd - daemon de rampa de gamma com nivel do preto por monitor.
+
+Mantem uma conexao Wayland, pega um zwlr_gamma_control_v1 por output e aplica
+uma rampa calculada a partir dos valores do wl-gammarelay-rs (gamma,
+temperatura, brilho, invertido) mais um pedestal de preto ("Black") guardado no
+store do wayscreen (~/.config/wayscreen/config.json).
+
+Como o wl-gammarelay-rs reescreve a rampa quando suas propriedades mudam, este
+daemon observa os valores periodicamente e reaplica logo em seguida. Com
+Black=0 a rampa resultante e identica a do wl-gammarelay-rs (mesma matematica),
+entao nao ha mudanca visual.
+
+Opcoes:
+  --once     aplica uma vez e sai (diagnostico)
+  --build    apenas compila/valida a lib de rampa e sai
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+# --- protocolo wlr-gamma-control (bindings gerados) --------------------------
+sys.path.insert(0, os.path.join(HERE, "protocols"))
+import pywayland.protocol.wayland as _wlwayland  # noqa: E402
+
+import wlrproto  # noqa: E402
+
+sys.modules.setdefault("wlrproto.wayland", _wlwayland)
+
+from wlrproto.wlr_gamma_control_unstable_v1 import (  # noqa: E402
+    ZwlrGammaControlManagerV1,
+)
+from pywayland.client import Display  # noqa: E402
+from pywayland.protocol.wayland import WlOutput  # noqa: E402
+
+import gi  # noqa: E402
+
+gi.require_version("Gio", "2.0")
+gi.require_version("GLibUnix", "2.0")
+from gi.repository import Gio, GLib, GLibUnix  # noqa: E402
+
+from ramp import fill_ramp  # noqa: E402
+
+BUS_NAME = "rs.wl-gammarelay"
+IFACE = "rs.wl.gammarelay"
+GLOBAL = "global"
+
+CONFIG_DIR = os.environ.get("WAYSCREEN_CONFIG_DIR") or os.path.expanduser(
+    "~/.config/wayscreen"
+)
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+
+POLL_MS = 250
+
+
+def _load_black():
+    """{monitor: black} lido do store; inclui a chave 'global'."""
+    try:
+        with open(CONFIG_FILE) as f:
+            cfg = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    out = {}
+    monitors = cfg.get("monitors")
+    if isinstance(monitors, dict):
+        for name, vals in monitors.items():
+            if isinstance(vals, dict) and "Black" in vals:
+                try:
+                    out[name] = float(vals["Black"])
+                except (TypeError, ValueError):
+                    pass
+    return out
+
+
+class Output:
+    def __init__(self, reg_name, wl_output, gamma_control):
+        self.reg_name = reg_name
+        self.wl = wl_output
+        self.gc = gamma_control
+        self.name = None
+        self.size = 0
+        self.last = None
+
+
+class GammaDaemon:
+    def __init__(self):
+        self.display = Display()
+        self.display.connect()
+        self.registry = self.display.get_registry()
+        self.registry.dispatcher["global"] = self._on_global
+        self.registry.dispatcher["global_remove"] = self._on_global_remove
+        self._globals = []
+        self.manager = None
+        self.outputs = {}
+        self._black_cache = ({}, 0.0)
+
+        self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+
+        self.display.roundtrip()
+
+        for name, interface, version in self._globals:
+            if interface == "zwlr_gamma_control_manager_v1":
+                self.manager = self.registry.bind(
+                    name, ZwlrGammaControlManagerV1, min(version, 1)
+                )
+        if self.manager is None:
+            raise RuntimeError(
+                "O compositor nao implementa wlr-gamma-control-unstable-v1"
+            )
+
+        for name, interface, version in self._globals:
+            if interface == "wl_output":
+                        self._bind_output(name, min(version, 4))
+
+        self.display.roundtrip()
+
+    # -- registry ------------------------------------------------------------
+    def _on_global(self, registry, name, interface, version):
+        self._globals.append((name, interface, version))
+
+    def _on_global_remove(self, registry, name):
+        out = self.outputs.pop(name, None)
+        if out is not None:
+            try:
+                out.gc.destroy()
+            except Exception:
+                pass
+            try:
+                out.wl.release()
+            except Exception:
+                pass
+        self._globals = [g for g in self._globals if g[0] != name]
+
+    def _bind_output(self, name, version):
+        wl_output = self.registry.bind(name, WlOutput, version)
+        gamma_control = self.manager.get_gamma_control(wl_output)
+        out = Output(name, wl_output, gamma_control)
+
+        wl_output.dispatcher["name"] = lambda proxy, oname, o=out: self._on_output_name(o, oname)
+        gamma_control.dispatcher["gamma_size"] = lambda proxy, size, o=out: self._on_gamma_size(o, size)
+        gamma_control.dispatcher["failed"] = lambda proxy, o=out: self._on_failed(o)
+
+        self.outputs[name] = out
+
+    # -- events --------------------------------------------------------------
+    def _on_output_name(self, out, name):
+        out.name = name if isinstance(name, str) else name.decode(errors="replace")
+        out.last = None
+
+    def _on_gamma_size(self, out, size):
+        out.size = int(size)
+        out.last = None
+
+    def _on_failed(self, out):
+        self.outputs.pop(out.reg_name, None)
+
+    # -- colors --------------------------------------------------------------
+    def _relay_props(self, path):
+        try:
+            res = self.bus.call_sync(
+                BUS_NAME, path, "org.freedesktop.DBus.Properties", "GetAll",
+                GLib.Variant("(s)", (IFACE,)),
+                GLib.VariantType.new("(a{sv})"),
+                Gio.DBusCallFlags.NONE, 500, None,
+            )
+        except GLib.Error:
+            return None
+        return res.unpack()[0]
+
+    def read_color(self, out):
+        path = "/"
+        if out.name:
+            path = "/outputs/" + out.name.replace("-", "_")
+        props = self._relay_props(path)
+        if props is None and path != "/":
+            props = self._relay_props("/")
+        if props is None:
+            return None
+        try:
+            return (
+                int(props.get("Temperature", 6500)),
+                float(props.get("Gamma", 1.0)),
+                float(props.get("Brightness", 1.0)),
+                bool(props.get("Inverted", False)),
+            )
+        except (TypeError, ValueError):
+            return None
+
+    def black_for(self, name):
+        blacks, stamp = self._black_cache
+        now = time.monotonic()
+        if now - stamp > 1.0:
+            blacks = _load_black()
+            self._black_cache = (blacks, now)
+        if name and name in blacks:
+            return blacks[name]
+        return blacks.get(GLOBAL, 0.0)
+
+    # -- apply ---------------------------------------------------------------
+    def apply(self, out):
+        if out.size <= 0:
+            return
+        color = self.read_color(out)
+        if color is None:
+            return
+        temp, gamma, brightness, inverted = color
+        black = self.black_for(out.name)
+        data = fill_ramp(out.size, temp, gamma, brightness, inverted, black)
+
+        fd = os.memfd_create("wayscreen-ramp")
+        try:
+            os.ftruncate(fd, len(data))
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view):]
+            out.gc.set_gamma(fd)
+            self.display.flush()
+        finally:
+            os.close(fd)
+        out.last = (temp, gamma, brightness, inverted, round(black, 6))
+
+    def tick(self):
+        for out in list(self.outputs.values()):
+            if out.size <= 0:
+                continue
+            color = self.read_color(out)
+            if color is None:
+                continue
+            black = round(self.black_for(out.name), 6)
+            key = (*color, black)
+            if key != out.last:
+                self.apply(out)
+        return True
+
+
+def _on_wayland(fd, condition, user_data):
+    daemon = user_data
+    try:
+        if condition & Gio.IOCondition.IN:
+            daemon.display.read()
+            daemon.display.dispatch(block=False)
+        daemon.display.flush()
+    except Exception as exc:  # pragma: no cover
+        print(f"[wayscreen-rampd] erro wayland: {exc}", file=sys.stderr)
+        return False
+    return True
+
+
+def main():
+    if "--build" in sys.argv:
+        from ramp import fill_ramp as f
+
+        f(16, 6500, 1.0, 1.0)
+        print("ramp lib OK")
+        return 0
+
+    daemon = GammaDaemon()
+
+    if "--probe" in sys.argv:
+        print(f"globals={len(daemon._globals)} manager={'ok' if daemon.manager else 'none'}")
+        for out in daemon.outputs.values():
+            print(f"  output reg={out.reg_name} name={out.name!r} size={out.size}")
+        return 0
+
+    if "--once" in sys.argv:
+        for out in daemon.outputs.values():
+            if out.size > 0:
+                daemon.apply(out)
+        return 0
+
+    print(
+        f"[wayscreen-rampd] {len(daemon.outputs)} output(s): "
+        + ", ".join(o.name or f"reg:{o.reg_name}" for o in daemon.outputs.values()),
+        file=sys.stderr,
+    )
+
+    GLibUnix.fd_add_full(
+        GLib.PRIORITY_DEFAULT,
+        daemon.display.get_fd(),
+        GLib.IOCondition.IN,
+        _on_wayland,
+        daemon,
+    )
+    GLib.timeout_add(POLL_MS, daemon.tick)
+    GLib.MainLoop().run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
